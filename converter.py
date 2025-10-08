@@ -62,18 +62,26 @@ class FigmaToShotstackConverter:
     def parse_node(self, node: Dict[str, Any], canvas_width: float, canvas_height: float) -> Optional[Dict[str, Any]]:
         """Parse a Figma node into Shotstack asset data"""
         node_type = node.get('type')
-        
+
         if node_type == 'TEXT':
             return self._parse_text_node(node, canvas_width, canvas_height)
-        elif node_type == 'RECTANGLE' and node.get('fills', []):
+        elif node_type == 'RECTANGLE':
             # Check if it has image fill
             for fill in node.get('fills', []):
                 if fill.get('type') == 'IMAGE':
                     return self._parse_image_node(node, canvas_width, canvas_height)
-        elif node_type == 'FRAME':
-            # For frames, we'll export as background images
+            # If no image fill but has fills, return as rectangle
+            if node.get('fills', []):
+                return self._parse_image_node(node, canvas_width, canvas_height)
+        elif node_type == 'VECTOR':
+            # Parse vector as an image
             return self._parse_frame_node(node, canvas_width, canvas_height)
-            
+        elif node_type == 'FRAME':
+            # Only export frames if they don't have children (leaf frames)
+            # Otherwise, we'll process their children instead
+            if not node.get('children', []):
+                return self._parse_frame_node(node, canvas_width, canvas_height)
+
         return None
     
     def _parse_text_node(self, node: Dict[str, Any], canvas_width: float, canvas_height: float) -> Dict[str, Any]:
@@ -120,7 +128,7 @@ class FigmaToShotstackConverter:
         """Parse image node to image asset"""
         bbox = node.get('absoluteBoundingBox', {})
         x_offset, y_offset = self._calculate_offset(bbox, canvas_width, canvas_height)
-        
+
         return {
             'type': 'image',
             'asset': {
@@ -129,12 +137,30 @@ class FigmaToShotstackConverter:
             },
             'position': 'center',
             'offset': {'x': x_offset, 'y': y_offset},
-            'fit': 'none',
+            'fit': 'crop',
             'scale': 1
         }
     
     def _parse_frame_node(self, node: Dict[str, Any], canvas_width: float, canvas_height: float) -> Dict[str, Any]:
         """Parse frame node as background image"""
+        bbox = node.get('absoluteBoundingBox', {})
+        x_offset, y_offset = self._calculate_offset(bbox, canvas_width, canvas_height)
+
+        # Calculate scale based on frame dimensions
+        frame_width = bbox.get('width', canvas_width)
+        frame_height = bbox.get('height', canvas_height)
+
+        # Use min dimension for small landscape elements (like logos)
+        is_landscape = frame_width > frame_height * 1.5
+        is_small = max(frame_width, frame_height) < 400
+
+        if is_landscape and is_small:
+            # Small landscape elements: use min dimension
+            scale = min(frame_width, frame_height) / canvas_width
+        else:
+            # Default: use average of width and height
+            scale = ((frame_width / canvas_width) + (frame_height / canvas_height)) / 2
+
         return {
             'type': 'frame',
             'asset': {
@@ -142,8 +168,9 @@ class FigmaToShotstackConverter:
                 'src': f'{{{{ FRAME_{node.get("name", "").upper().replace(" ", "_")} }}}}'
             },
             'position': 'center',
-            'fit': 'none',
-            'scale': 1
+            'offset': {'x': x_offset, 'y': y_offset},
+            'fit': 'crop',
+            'scale': round(scale, 3)
         }
     
     def _calculate_offset(self, bbox: Dict[str, Any], canvas_width: float, canvas_height: float) -> Tuple[float, float]:
@@ -151,83 +178,154 @@ class FigmaToShotstackConverter:
         # Get center of the bounding box
         x = bbox.get('x', 0) + bbox.get('width', 0) / 2
         y = bbox.get('y', 0) + bbox.get('height', 0) / 2
-        
+
         # Convert to Shotstack normalized coordinates (-1 to 1)
-        # Figma: (0,0) top-left, Shotstack: (0,0) center
+        # Figma: (0,0) top-left, Y increases downward
+        # Shotstack: (0,0) center, Y increases UPWARD (opposite of Figma)
         x_offset = (x - canvas_width / 2) / (canvas_width / 2)
         y_offset = (y - canvas_height / 2) / (canvas_height / 2)
-        
+
+        # Negate Y to flip coordinate system
+        y_offset = -y_offset
+
+        # Divide by 2 to account for coordinate space scaling
+        x_offset = x_offset / 2
+        y_offset = y_offset / 2
+
         # Clamp to reasonable bounds
         x_offset = max(-1, min(1, x_offset))
         y_offset = max(-1, min(1, y_offset))
-        
+
         return round(x_offset, 3), round(y_offset, 3)
     
-    def _extract_node_ids(self, node: Dict[str, Any]) -> List[str]:
+    def _extract_node_ids(self, node: Dict[str, Any], skip_parent: bool = False) -> List[str]:
         """Recursively extract all node IDs from a page for image fetching"""
         node_ids = []
-        
-        # Add current node ID if it has visual content
-        if node.get('type') in ['FRAME', 'RECTANGLE', 'ELLIPSE', 'POLYGON', 'STAR', 'VECTOR', 'INSTANCE', 'COMPONENT']:
+
+        # Add current node ID if it has visual content (skip parent frame)
+        if not skip_parent and node.get('type') in ['FRAME', 'RECTANGLE', 'ELLIPSE', 'POLYGON', 'STAR', 'VECTOR', 'INSTANCE', 'COMPONENT']:
             node_ids.append(node['id'])
-        
+
         # Recursively collect children
         for child in node.get('children', []):
-            node_ids.extend(self._extract_node_ids(child))
-        
+            node_ids.extend(self._extract_node_ids(child, skip_parent=False))
+
         return node_ids
     
-    def _fetch_figma_images(self, file_key: str, node_ids: List[str], format: str = 'png', scale: float = 2.0) -> Dict[str, str]:
+    def _fetch_figma_images(self, file_key: str, node_ids: List[str], format: str = 'png', scale: float = 2.0, quiet: bool = False) -> Dict[str, str]:
         """Fetch image URLs from Figma for given node IDs"""
         try:
             if not node_ids:
                 return {}
-                
-            print(f"Fetching images for {len(node_ids)} nodes...")
+
+            if not quiet:
+                print(f"Fetching images for {len(node_ids)} nodes...")
             images_response = self.figma.get_file_images(
                 file_key=file_key,
                 ids=node_ids,
                 format=format,
                 scale=scale
             )
-            
+
             # Extract images from response object
             if hasattr(images_response, 'images') and images_response.images:
                 images = images_response.images
             else:
                 images = {}
-            
+
             # Filter out None values and empty URLs
             valid_images = {k: v for k, v in images.items() if v and v.strip()}
-            print(f"Successfully fetched {len(valid_images)} images")
-            
+            if not quiet:
+                print(f"Successfully fetched {len(valid_images)} images")
+
             return valid_images
-            
+
         except Exception as e:
-            print(f"Warning: Failed to fetch images from Figma: {e}")
+            if not quiet:
+                print(f"Warning: Failed to fetch images from Figma: {e}")
             return {}
     
-    def _extract_all_nodes(self, node: Dict[str, Any], canvas_width: float, canvas_height: float) -> List[Dict[str, Any]]:
+    def _extract_all_nodes(self, node: Dict[str, Any], canvas_width: float, canvas_height: float, skip_parent: bool = False) -> List[Dict[str, Any]]:
         """Recursively extract all nodes from a page"""
         nodes = []
-        
-        # Parse current node
-        parsed = self.parse_node(node, canvas_width, canvas_height)
-        if parsed:
-            # Add node ID for image fetching
-            parsed['node_id'] = node.get('id')
-            nodes.append(parsed)
-        
-        # Recursively parse children
-        for child in node.get('children', []):
-            nodes.extend(self._extract_all_nodes(child, canvas_width, canvas_height))
-        
+
+        # Skip parent frame itself
+        if skip_parent:
+            for child in node.get('children', []):
+                nodes.extend(self._extract_all_nodes(child, canvas_width, canvas_height, skip_parent=False))
+            return nodes
+
+        node_type = node.get('type')
+
+        # Special handling for FRAMEs with image children
+        if node_type == 'FRAME' and node.get('children'):
+            # Check if this frame contains image nodes (RECTANGLE or VECTOR)
+            image_children = [
+                child for child in node.get('children', [])
+                if child.get('type') in ['RECTANGLE', 'VECTOR']
+            ]
+
+            if image_children:
+                # Use the FRAME's bbox for positioning and scale, but the child's image
+                frame_bbox = node.get('absoluteBoundingBox', {})
+                x_offset, y_offset = self._calculate_offset(frame_bbox, canvas_width, canvas_height)
+
+                # Calculate scale based on frame dimensions
+                frame_width = frame_bbox.get('width', canvas_width)
+                frame_height = frame_bbox.get('height', canvas_height)
+
+                # Use min dimension for small landscape elements (like logos)
+                # to prevent them from being too large
+                is_landscape = frame_width > frame_height * 1.5
+                is_small = max(frame_width, frame_height) < 400
+
+                if is_landscape and is_small:
+                    # Small landscape elements: use min dimension
+                    scale = min(frame_width, frame_height) / canvas_width
+                else:
+                    # Default: use average of width and height
+                    scale = ((frame_width / canvas_width) + (frame_height / canvas_height)) / 2
+
+                # Use the first image child's node ID for fetching
+                image_child = image_children[0]
+
+                parsed = {
+                    'type': 'image',
+                    'asset': {
+                        'type': 'image',
+                        'src': '{{ IMAGE_PLACEHOLDER }}'
+                    },
+                    'position': 'center',
+                    'offset': {'x': x_offset, 'y': y_offset},
+                    'fit': 'crop',
+                    'scale': round(scale, 3),
+                    'node_id': image_child.get('id'),  # Child's ID for image
+                    'node_name': node.get('name'),  # Frame's name
+                    'frame_bbox': frame_bbox  # Store for reference
+                }
+                nodes.append(parsed)
+                return nodes  # Don't process children separately
+
+        # Handle VECTOR nodes (like backgrounds)
+        if node_type == 'VECTOR':
+            parsed = self._parse_frame_node(node, canvas_width, canvas_height)
+            if parsed:
+                parsed['node_id'] = node.get('id')
+                parsed['node_name'] = node.get('name')
+                nodes.append(parsed)
+            return nodes
+
+        # For other node types, recursively process children
+        if node_type == 'FRAME':
+            for child in node.get('children', []):
+                nodes.extend(self._extract_all_nodes(child, canvas_width, canvas_height, skip_parent=False))
+
         return nodes
     
-    def convert_to_shotstack(self, file_key: str, page_name: Optional[str] = None, 
+    def convert_to_shotstack(self, file_key: str, page_name: Optional[str] = None,
                            output_width: int = 1200, output_height: int = 1200,
                            duration: float = 5.0, populate_images: bool = False,
-                           image_only: bool = False) -> Dict[str, Any]:
+                           image_only: bool = False, quiet: bool = False) -> Dict[str, Any]:
         """Convert Figma page to Shotstack template"""
         
         # Extract page data
@@ -247,33 +345,61 @@ class FigmaToShotstackConverter:
                 canvas_height = bbox.get('height', output_height)
                 break
         
-        # Extract all design elements
+        # Extract all design elements (skip the main frame itself)
         all_nodes = []
         if main_frame:
-            all_nodes = self._extract_all_nodes(main_frame, canvas_width, canvas_height)
+            all_nodes = self._extract_all_nodes(main_frame, canvas_width, canvas_height, skip_parent=True)
         else:
             # No main frame, process all children
             for child in page.get('children', []):
-                all_nodes.extend(self._extract_all_nodes(child, canvas_width, canvas_height))
-        
+                all_nodes.extend(self._extract_all_nodes(child, canvas_width, canvas_height, skip_parent=False))
+
         # Fetch real images if requested
         figma_images = {}
         if populate_images:
-            # Collect all node IDs that need images
-            node_ids = [node['node_id'] for node in all_nodes if node.get('node_id') and node.get('type') in ['frame', 'image']]
+            # Collect all node IDs that need images (skip parent frame)
+            node_ids = []
+            if main_frame:
+                # Skip the main frame ID itself
+                node_ids = self._extract_node_ids(main_frame, skip_parent=True)
+            else:
+                for child in page.get('children', []):
+                    node_ids.extend(self._extract_node_ids(child, skip_parent=False))
+
             if node_ids:
-                figma_images = self._fetch_figma_images(file_key, node_ids)
+                figma_images = self._fetch_figma_images(file_key, node_ids, quiet=quiet)
         
         # Adjust duration for image-only mode
         if image_only:
             duration = 1.0  # Minimal duration for static image output
         
         # Build Shotstack timeline
+        # Custom ordering: Logo first (front), Background second (back), then middle layers
+        def get_layer_order(node):
+            """Custom sort key for layer ordering"""
+            name = node.get('node_name', '').lower()
+
+            # Logo/Frame 4 should be first (front-most layer)
+            if 'frame 4' in name or 'logo' in name:
+                return 0
+            # Background/Frame 1 should be second
+            elif 'frame 1' in name or 'background' in name:
+                return 1
+            # Frame 2 before Frame 3
+            elif 'frame 2' in name:
+                return 2
+            elif 'frame 3' in name:
+                return 3
+            else:
+                return 10  # Others last
+
+        all_nodes_sorted = sorted(all_nodes, key=get_layer_order)
+
         tracks = []
         merge_variables = []
         variable_counter = 1
-        
-        for node_data in all_nodes:
+
+        for node_data in all_nodes_sorted:
             # Create asset for clip
             asset = node_data['asset'].copy()
             
@@ -282,7 +408,8 @@ class FigmaToShotstackConverter:
                 real_image_url = figma_images[node_data['node_id']]
                 if asset.get('type') == 'image':
                     asset['src'] = real_image_url
-                    print(f"Using real image for node {node_data['node_id']}: {real_image_url[:50]}...")
+                    if not quiet:
+                        print(f"Using real image for node {node_data['node_id']}: {real_image_url[:50]}...")
             
             # Create clip for each element
             clip = {

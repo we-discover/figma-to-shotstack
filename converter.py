@@ -4,6 +4,28 @@ FigmaToShotstackConverter Class
 
 Core converter class for transforming Figma designs into Shotstack templates.
 Extracts text layers, images, and positioning to create video/image templates.
+
+IMPORTANT NOTES FOR DYNAMIC IMAGES:
+
+The generated Shotstack templates use specific fit modes based on element type:
+- Small landscape elements (logos): fit='contain' - Shows full image, may letterbox
+- Regular images: fit='crop' - Center crops to fill frame, may crop edges
+
+Expected aspect ratios for optimal results (based on Figma frame dimensions):
+- Background frames (1:1 square): Provide 1:1 images
+- Landscape frames (2:1 wide): Provide similar wide images (1.5:1 to 2:1)
+- Logo frames (~2.3:1): Logos will show in full with 'contain', any aspect works
+
+When using MediaGraph or dynamic image substitution:
+1. Images with different aspect ratios will crop differently than Figma design
+2. For production: Consider preprocessing images to match target aspect ratios
+3. Logos use 'contain' mode so full logo always displays (may have padding)
+4. Large images use 'crop' mode for center-crop behavior
+
+To get exact Figma crop behavior, images should match these aspect ratios:
+- Frame 2 (Image slot 2): ~1.23:1 (slightly wide)
+- Frame 3 (Image slot 1): ~1.33:1 (landscape)
+- Frame 4 (Logo): ~2.3:1 (very wide landscape)
 """
 
 import json
@@ -150,22 +172,18 @@ class FigmaToShotstackConverter:
         frame_width = bbox.get('width', canvas_width)
         frame_height = bbox.get('height', canvas_height)
 
-        # Use min dimension for small landscape elements (like logos)
-        is_landscape = frame_width > frame_height * 1.5
-        is_small = max(frame_width, frame_height) < 400
+        # Always use average scale calculation
+        scale = ((frame_width / canvas_width) + (frame_height / canvas_height)) / 2
 
-        if is_landscape and is_small:
-            # Small landscape elements: use min dimension
-            scale = min(frame_width, frame_height) / canvas_width
-        else:
-            # Default: use average of width and height
-            scale = ((frame_width / canvas_width) + (frame_height / canvas_height)) / 2
+        # Create placeholder name from node name
+        node_name = node.get('name', 'BACKGROUND')
+        placeholder_name = node_name.upper().replace(' ', '_')
 
         return {
             'type': 'frame',
             'asset': {
                 'type': 'image',
-                'src': f'{{{{ FRAME_{node.get("name", "").upper().replace(" ", "_")} }}}}'
+                'src': f'{{{{ {placeholder_name} }}}}'
             },
             'position': 'center',
             'offset': {'x': x_offset, 'y': y_offset},
@@ -274,34 +292,44 @@ class FigmaToShotstackConverter:
                 frame_width = frame_bbox.get('width', canvas_width)
                 frame_height = frame_bbox.get('height', canvas_height)
 
-                # Use min dimension for small landscape elements (like logos)
-                # to prevent them from being too large
+                # Determine if this is a small element (like a logo)
                 is_landscape = frame_width > frame_height * 1.5
                 is_small = max(frame_width, frame_height) < 400
 
+                # Always use average scale calculation
+                scale = ((frame_width / canvas_width) + (frame_height / canvas_height)) / 2
+
+                # Use 'contain' for small elements like logos to always show full content
+                # Use 'crop' for larger images to center crop to fit frame
                 if is_landscape and is_small:
-                    # Small landscape elements: use min dimension
-                    scale = min(frame_width, frame_height) / canvas_width
+                    fit_mode = 'contain'
                 else:
-                    # Default: use average of width and height
-                    scale = ((frame_width / canvas_width) + (frame_height / canvas_height)) / 2
+                    fit_mode = 'crop'
 
                 # Use the first image child's node ID for fetching
                 image_child = image_children[0]
+
+                # Calculate expected aspect ratio for this frame (for documentation)
+                expected_aspect = round(frame_width / frame_height, 2)
+
+                # Create placeholder name from frame name
+                frame_name = node.get('name', 'IMAGE')
+                placeholder_name = frame_name.upper().replace(' ', '_')
 
                 parsed = {
                     'type': 'image',
                     'asset': {
                         'type': 'image',
-                        'src': '{{ IMAGE_PLACEHOLDER }}'
+                        'src': f'{{{{ {placeholder_name} }}}}'
                     },
                     'position': 'center',
                     'offset': {'x': x_offset, 'y': y_offset},
-                    'fit': 'crop',
+                    'fit': fit_mode,
                     'scale': round(scale, 3),
                     'node_id': image_child.get('id'),  # Child's ID for image
                     'node_name': node.get('name'),  # Frame's name
-                    'frame_bbox': frame_bbox  # Store for reference
+                    'frame_bbox': frame_bbox,  # Store for reference
+                    '_expected_aspect': expected_aspect  # For documentation (removed before output)
                 }
                 nodes.append(parsed)
                 return nodes  # Don't process children separately
